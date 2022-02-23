@@ -1,0 +1,22 @@
+{
+    "entry_url": "...",
+    "hmac_key": "...",
+    "admins": ["..."],
+    "guild_ids": [integer],
+    "token": "...your token here...",
+    "checker-email":"account email",
+    "checker-pass":"account password",
+    "chats": [
+        {
+            "name": ...,
+            "playerid": ..,
+            "teamid": ...,
+            "email": ...,
+            "pass": ...,
+            "channel": ...,
+            "read_only": True|False
+        },
+        ...
+    ]
+}
+
