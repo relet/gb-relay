@@ -6,18 +6,31 @@ import discord
 from discord.ext import tasks, commands
 from discord_slash import SlashCommand, SlashContext
 from discord_slash.utils.manage_commands import create_option
+import enet
 import json
 import hmac
 import hashlib
 import logging
+import logging.handlers
 import websockets
 import requests
 import time
 import sys
 
+def log_setup():
+    log_handler = logging.handlers.WatchedFileHandler('/var/log/gb-relay.log')
+    formatter = logging.Formatter(
+        '%(asctime)s program_name [%(process)d]: %(message)s',
+        '%b %d %H:%M:%S')
+    formatter.converter = time.gmtime  # if you want UTC time
+    log_handler.setFormatter(formatter)
+    logger = logging.getLogger()
+    logger.addHandler(log_handler)
+    logger.setLevel(logging.INFO)
+
 command_token="!"
 
-logging.basicConfig(level=logging.INFO)
+log_setup()
 logger = logging.getLogger(name="gb-relay")
 
 settings = json.load(open('.settings','r'))
@@ -26,6 +39,9 @@ state = json.load(open('.state','r'))
 gb_entryURL = settings.get('entry_url')
 hmac_key = bytes(settings.get('hmac_key',''), 'utf-8')
 admins = settings.get('admins')
+
+is_running = False
+RATE_LIMIT = 300
 
 def keep_state():
     fd = open('.state','w')
@@ -62,6 +78,28 @@ async def reply(ctx, reply):
     await send_reply(ctx.channel.id, ctx.author.display_name, reply)
     await ctx.send(reply+"\nYour reply was queued and will be sent during the next relay.", delete_after=60.0)
 
+@slash.slash(name = "notify",
+             description = "Notify a player when they are online.",
+             options = [
+                 create_option(
+                     name = "player",
+                     description = "a substring of the player name or id you want to notify",
+                     option_type = 3,
+                     required = True
+                 ),
+                 create_option(
+                     name = "message",
+                     description = "the message you want to send.",
+                     option_type = 3,
+                     required = True
+                 )
+             ],
+             guild_ids = settings.get('guild_ids',[]))
+async def notify(ctx, player, message):
+    await ctx.defer()
+    await send_notify(ctx.channel.id, ctx.author.display_name, player, message)
+    await ctx.send(message+"\nYour notification was queued and will be sent when the player is online.", delete_after=60.0)
+
 @slash.slash(name = "announce",
              description = "Send a reply to the ingame chat of all teams.",
              options = [
@@ -79,7 +117,7 @@ async def announce(ctx, message):
         if chat.get('read_only'):
             continue
         await send_reply(chat.get('channel'), ctx.author.display_name, message)
-    await ctx.send("Your announcement was queued and will be sent during the next relay.", delete_after=60.0)
+    await ctx.send(message+"\nYour announcement was queued and will be sent during the next relay.", delete_after=60.0)
 
 @slash.slash(name = "yellowcard",
              description = "Warn and demote a player / issue a yellow card.",
@@ -141,6 +179,8 @@ async def boot(ctx, player):
 # queue messages for delivery
 async def send_reply(channel, author, reply):
     await store_event(channel, ":| "+str(author)+" (via discord) |:", reply)
+async def send_notify(channel, author, target, message):
+    await store_event(channel, "!"+target, ":| "+str(author)+" (via discord) |:\n"+message)
 async def store_warning(channel, player):
     await store_event(channel, "yellow", player)
 async def store_redcard(channel, player):
@@ -216,10 +256,17 @@ async def is_player_online(player_id):
 
     # if login is newer than 5 minutes, this player is online
     # TODO: check if that even works
-    return (delta < 250.0)
+    logger.info("Player {} was last online {} ms ago.".format(player_id, delta))
+    return (delta < (RATE_LIMIT-5)*1000.0)
 
 # welcome or ban people
+welcomed={}
 async def welcome_and_promote(ws, team_id, who, pid):
+    if pid in welcomed:
+        logger.info("Refusing to welcome {} twice.".format(who))
+        return
+    welcomed[pid]=True
+
     redlist = state.get('redlist',[])
     if pid in redlist:
         chatmessage="""{}, Du bist bei uns nicht mehr willkommen. Wenn Du dagegen Einwände hast, rede mit uns auf Discord.""".format(who)
@@ -255,7 +302,8 @@ async def welcome_and_promote(ws, team_id, who, pid):
     if pid in redlist:
         action="BOOT_PLAYER"
     else:
-        action="PROMOTE_PLAYER"
+        return
+        #action="PROMOTE_PLAYER"
 
     time.sleep(1.0)
     await ws.send(json.dumps( {
@@ -340,12 +388,28 @@ async def get_player_by_id_or_string(sock, team_id, search):
                     return pid, who
             return None, None
 
+async def watch(sock, match):
+    request = json.dumps({
+                    "@class": ".LogEventRequest",
+                    "eventKey": "GET_ACTIVE_MATCH_INFO",
+                    "MATCH_ID": match,
+                    "requestId": match
+                })
+    await sock.send(request)
+
 # get chat messages
-@tasks.loop(seconds=60)
+@tasks.loop(seconds=RATE_LIMIT)
 async def check_chats():
+    global is_running
+
+    if is_running:
+        logger.warn("Not starting background task, still running.")
+    is_running = True
     logger.info("Starting background task")
+
     chats = settings.get('chats')
     for chat in chats:
+        logger.info("Checking "+chat['name'])
         if await is_player_online(chat['playerid']):
             continue
         sock = await connect_as(chat['email'], chat['pass'])
@@ -360,6 +424,7 @@ async def check_chats():
             continue
 
         messages = state.get('queued_messages',{}).get(str(channel.id),[])
+        new_queue = []
         if not chat.get('read_only'):
           for msg in messages:
             author, reply = msg # or event and player
@@ -378,6 +443,19 @@ async def check_chats():
                 if not pid:
                     continue
                 await boot_player(sock, team_id, pid)
+            elif author[0] == "!":
+                pid, pname = await get_player_by_id_or_string(sock, team_id, author[1:])
+                if not pid:
+                    continue
+                if await is_player_online(pid):
+                    await sock.send(json.dumps( {
+                       "@class": ".SendTeamChatMessageRequest",
+                       "teamId": team_id,
+                       "message": json.dumps({"type":"chat", "msg": reply}),
+                       "requestId": "reply"
+                    }))
+                else:
+                    new_queue.append(msg)
             else:
                 await sock.send(json.dumps( {
                     "@class": ".SendTeamChatMessageRequest",
@@ -387,7 +465,7 @@ async def check_chats():
                 }))
 
         state['queued_messages']=state.get('queued_messages',{})
-        state['queued_messages'][str(channel.id)]=[]
+        state['queued_messages'][str(channel.id)]=new_queue
         keep_state()
 
         await sock.send(json.dumps({
@@ -396,6 +474,7 @@ async def check_chats():
             "requestId": team_id,
             "teamId": team_id
         }))
+
         while True:
             data = json.loads(await sock.recv())
             if data.get('requestId')==team_id:
@@ -458,13 +537,165 @@ async def check_chats():
 
             last_posted_message[team_id] = line['when']
             state['last_posted_message'] = last_posted_message
+            print("Last posted message is kept")
             keep_state()
 
             if not chat.get('read_only'):
-              for join in joined.keys():
-                logger.info("promoting (or banning)", join, joined[join])
+              for join in set(joined.keys()):
+                logger.info("promoting or banning {}.".format(join))
                 await welcome_and_promote(sock, team_id, join, joined[join])
+
+
+        # TODO: get team activity
+        request = json.dumps({
+            "@class": ".LogEventRequest",
+            "team_id": team_id,
+           "eventKey": "GET_TEAM_REQUEST",
+           "requestId": "gtr"
+        })
+        team_name=""
+        await sock.send(request)
+
+        online = []
+        matches = {}
+        while True:
+            message = await sock.recv()
+            data=json.loads(message)
+
+            if data.get('requestId')=="gtr":
+                team_name=data.get('scriptData',{}).get('teamName','')
+                members=data.get('scriptData',{}).get('members')
+                for mem in members:
+                    pid = mem.get('id')
+                    name = mem.get('displayName')
+                    is_online = mem.get('online')
+                    if is_online:
+                        if pid != chat.get('playerid'):
+                            online.append(name)
+                    match = mem.get('scriptData',{}).get('active_match')
+                    if not match:
+                        continue
+                    matches[match]=(pid,name)
+                    await watch(sock, match)
+                break
+
+        channel = await client.fetch_channel(settings['status-channel'])
+        if not channel:
+            logger.error("Could not retrieve status channel id")
+            continue
+
+        matchdata = ""
+        num_matches = len(matches)
+
+        while len(matches)>0:
+            message = await sock.recv()
+            data=json.loads(message)
+
+            mid = data.get('requestId')
+            if mid in matches:
+                data = data.get('scriptData').get('data')
+                peerid = bytes(data.get('serverip'), 'utf-8')
+                port = data.get('serverport')
+                auth_token = data.get('spectatortoken').encode()
+
+                host = enet.Host(peerCount = 1)
+                peer = host.connect(address=enet.Address(peerid, port), channelCount=2)
+
+                #spectate a match match
+
+                msg = bytes.fromhex('0122') + bytes([len(auth_token)]) + bytearray(auth_token)
+                packet = enet.Packet(data=msg, flags=enet.PACKET_FLAG_RELIABLE)
+
+                event = host.service(1000)
+                #should be TYPE_CONNECT
+                if event.type != enet.EVENT_TYPE_CONNECT:
+                    print("{}: NOT CONNECTED".format(event.peer.address))
+                else:
+                    logger.info("Spectating to get info.")
+
+                    success = peer.send(0, packet)
+                    ping = peer.ping()
+
+                    while True:
+                        event = host.service(10000)
+                        if event.type == enet.EVENT_TYPE_DISCONNECT:
+                            break
+                        elif event.type == enet.EVENT_TYPE_RECEIVE:
+                            packet_type = event.packet.data[0]
+                            length = len(event.packet.data)
+
+                            if packet_type == 0x10 and length>100:
+                                #there are some 6 byte packets
+                                data = event.packet.data
+                                prev = 0
+                                pnum = 0
+                                players = {}
+
+                                while pnum<4:
+                                    start = data.find(b'{"player_data":', prev)
+                                    if start<1:
+                                        break
+                                    stop = data.find(b'}}', start)
+                                    stop = data.find(b'}}', stop+2)
+                                    pbytes = data[start:stop+2]
+                                    pjson = pbytes.decode()
+                                    pdata = json.loads(pjson)
+
+                                    pnum = pnum+1
+                                    pid = pdata.get('player_data').get('account_id')
+                                    if pid in players:
+                                        break
+                                    pname = pdata.get('player_data').get('display_name')
+                                    players[pid]=pname
+                                    plevel = pdata.get('player_data').get('level')
+                                    ptrophies = pdata.get('player_data').get('trophies')
+
+                                    matchdata += "> #{} - 🏆{} - {} (L{})\n".format(pnum, ptrophies, pname, plevel)
+                                    prev=stop+1
+
+                                peer.disconnect()
+                                matchdata += "\n"
+                                break
+
+                            else:
+                                # ignore any other packets. They are pings and OKs.
+                                continue
+
+            del matches[mid]
+            if len(matches)==0:
+                break
+
+        # COMPLETE STATUS MESSAGE
+        num_players = len(online)
+        status_info = """__{}__ *updated: {} UTC*
+{} Player{} online: {}.
+Found {} ongoing match{}:
+{}
+
+""".format(team_name[4:], time.ctime(), num_players, (num_players!=1) and "s" or "", ", ".join(online),
+           num_matches, (num_matches != 1) and "es" or "",
+           matchdata)
+        #########################
+
+        edited = False
+        status_message = state.get('status_message',{}).get(team_id)
+        if status_message:
+            message = await channel.fetch_message(status_message)
+            if message:
+                await message.edit(content=status_info)
+                edited = True
+                time.sleep(5) # avoid some rate limiting
+        if not edited:
+            message = await channel.send(status_info)
+            messages = state.get('status_message',{})
+            messages[team_id] = message.id
+            state['status_message'] = messages
+            keep_state()
+            time.sleep(5) # avoid some rate limiting
+
+        logger.info("Finished checking "+chat['name'])
     logger.info("Finished background task.")
+    is_running = False
 
 
 client.run(settings.get('token'))
