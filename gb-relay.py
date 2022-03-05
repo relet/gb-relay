@@ -41,7 +41,7 @@ hmac_key = bytes(settings.get('hmac_key',''), 'utf-8')
 admins = settings.get('admins')
 
 is_running = False
-RATE_LIMIT = 300
+RATE_LIMIT = 120
 
 def keep_state():
     fd = open('.state','w')
@@ -180,7 +180,7 @@ async def boot(ctx, player):
 async def send_reply(channel, author, reply):
     await store_event(channel, ":| "+str(author)+" (via discord) |:", reply)
 async def send_notify(channel, author, target, message):
-    await store_event(channel, "!"+target, ":| "+str(author)+" (via discord) |:\n"+message)
+    await store_event(channel, "!"+target, ":| "+str(author)+" (via discord, notifying "+target+") |:\n"+message)
 async def store_warning(channel, player):
     await store_event(channel, "yellow", player)
 async def store_redcard(channel, player):
@@ -230,34 +230,66 @@ async def connect_as(user, passwd):
 
     return sock
 
-async def is_player_online(player_id):
+async def is_player_online(player_id, team_id):
     sock = await connect_as(settings['checker-email'], settings['checker-pass'])
     if not sock:
         logger.error("Cannot log in checker account")
         return
+
+    if not team_id:
+        # long and tedious - we first need to get the team info, assuming the player has a team, to see if they are online
+        await sock.send(json.dumps({
+            "@class": ".LogEventRequest",
+            "player_id": player_id,
+            "eventKey": "PLAYER_INFO",
+            "requestId": player_id
+        }))
+
+        while True:
+            info = json.loads(await sock.recv())
+            if info.get('requestId')==player_id:
+                break
+
+        if not 'scriptData' in info:
+            logger.error("Cannot retrieve player info.")
+
+        team_id = info.get('scriptData',{}).get('data',{}).get('team_id')
+        if not team_id:
+            logger.info("Player has no team id")
+
     await sock.send(json.dumps({
         "@class": ".LogEventRequest",
-        "player_id": player_id,
-        "eventKey": "PLAYER_INFO",
-        "requestId": player_id
+        "requestId": "get_team",
+        "eventKey": "GET_TEAM_REQUEST",
+        "team_id": team_id,
     }))
 
     while True:
         info = json.loads(await sock.recv())
-        if info.get('requestId')==player_id:
+        if info.get('requestId')=="get_team":
             break
-    now = time.time() * 1000
 
     if not 'scriptData' in info:
-        logger.error("Cannot retrieve player info.")
+        logger.error("Cannot retrieve player's team info.")
 
-    last_login = info.get('scriptData').get('data').get('last_login')
-    delta = now - last_login
+    members = info.get('scriptData',{}).get('members',[])
+    for mem in members:
+        if mem.get('id')==player_id:
+            online = mem.get('online')
+            now = time.time() * 1000
+            last_login = mem.get('scriptData',{}).get('last_login',0)
+            #if online:
+            #    if now - last_login > 300:
+            #        logger.info(player_id+" is actually online.")
+            #    else:
+            #        logger.info(player_id+" just hopped in during the last five minutes")
+            #else:
+            #    logger.info(player_id+" is not online.")
+            return online
 
-    # if login is newer than 5 minutes, this player is online
-    # TODO: check if that even works
-    logger.info("Player {} was last online {} ms ago.".format(player_id, delta))
-    return (delta < (RATE_LIMIT-5)*1000.0)
+    logger.warn("Player {} not found in team data.".format(player_id))
+    return False
+
 
 # welcome or ban people
 welcomed={}
@@ -270,17 +302,17 @@ async def welcome_and_promote(ws, team_id, who, pid):
     redlist = state.get('redlist',[])
     if pid in redlist:
         chatmessage="""{}, Du bist bei uns nicht mehr willkommen. Wenn Du dagegen Einwände hast, rede mit uns auf Discord.""".format(who)
-        chatmessage_en="""{}, you are banned from the GoT family. If you want to appeal this decision, talk to us on Discord.""".format(who)
+        chatmessage_en="""{}, you are banned from the Wolf🐺Gang family. If you want to appeal this decision, talk to us on Discord.""".format(who)
     else:
         chatmessage="""Herzlich willkommen {} im Team! 🥳 Nachfolgend ein paar Regeln und Infos:
-1.) In Challenge-Matches spielen wir untereinander (GoT, Golfsrudel und Winterfell) immer auf Unentschieden
+1.) In Challenge-Matches spielen wir in der Wolf🐺Gang-Familie immer auf Unentschieden
 2.) Bitte verkaufe regelmäßig Karten
-3.) Wir chatten hauptsächlich auf Discord - mach mit auf ogy.de/GoT
+3.) Wir chatten hauptsächlich auf Discord - mach mit auf ogy.de/WG
 4.) Wenn du Fragen hast, lass es uns einfach wissen""".format(who)
         chatmessage_en="""Welcome {} to the team! 🥳 Here are a few rules and notes:
-1.) In challenge matches we always tie with our teammates (GoT, Golfsrudel, and Winterfell)
+1.) In challenge matches we tie with the entire Wolf🐺Gang family.
 2.) Please sell cards regularly
-3.) Most of the chatting happens on our Discord server. Join us on ogy.de/GoT
+3.) Most of the chatting happens on our Discord server. Join us on ogy.de/WG
 4.) If you have any questions, just ask away""".format(who)
 
     await ws.send(json.dumps( {
@@ -319,18 +351,17 @@ async def warn_and_demote(ws, team_id, who, pid, complaint):
     if complaint:
         compl_de=" von "+complaint
         compl_en=" by "+complaint
-    chatmessage="""🟨 Vorsicht {}! Wir spielen in der Challenge gegen Teammitglieder Unentschieden!
-Das gilt für GoT, Golfsrudel und Winterfell!
+    chatmessage="""🟨 Vorsicht {}! Wir spielen in der Challenge gegen Teammitglieder der Wolf Gang Unentschieden!
 Nach einer Beschwerde{} hast Du jetzt eine gelbe Karte. Bitte entschuldige Dich auf Discord, oder
 schenke einem anderen Teammitglied einen Challenge-Sieg um die Warnung abzubauen.""".format(who, compl_de)
 
-    chatmessage_en="""🟨 Careful {}! We tie in challenge matches with teammates (GoT, Golfsrudel and Winterfell)
+    chatmessage_en="""🟨 Careful {}! We tie in challenge matches with teammates in all Wolf Gang teams!
 After a complaint{}, you have been issued a yellow card. Please apologize on Discord, or forfeit
 another game against one of your team members to get rid of the warning""".format(who, compl_en)
 
     await ws.send(json.dumps( {
         "@class": ".SendTeamChatMessageRequest",
-        "teamId": auth['teamid'],
+        "teamId": team_id,
         "message": json.dumps({"type":"chat", "msg": chatmessage_en}),
         "requestId": "warn_en"
     }))
@@ -338,7 +369,7 @@ another game against one of your team members to get rid of the warning""".forma
 
     await ws.send(json.dumps( {
         "@class": ".SendTeamChatMessageRequest",
-        "teamId": auth['teamid'],
+        "teamId": team_id,
         "message": json.dumps({"type":"chat", "msg": chatmessage}),
         "requestId": "warn"
     }))
@@ -350,6 +381,7 @@ another game against one of your team members to get rid of the warning""".forma
         "player_id": pid,
         "requestId": "demote"
     }))
+    logger.info("Sent warning")
 
 async def boot_and_block(sock, team_id, pid):
     redlist = state.get('redlist',[])
@@ -374,15 +406,18 @@ async def get_player_by_id_or_string(sock, team_id, search):
         "eventKey": "GET_TEAM_REQUEST",
         "team_id": team_id,
     }))
+    logger.info("Searching for "+search)
     while True:
         message = await sock.recv()
         data=json.loads(message)
         if data.get("requestId")=="get_team":
+            logger.info("Got team info")
             members = data['scriptData']['members']
             for mem in members:
                 mempid = mem['id']
                 memname = mem['displayName']
                 if search in mempid or search in memname:
+                    logger.info("Found "+memname)
                     pid = mempid
                     who = memname
                     return pid, who
@@ -404,20 +439,26 @@ async def check_chats():
 
     if is_running:
         logger.warn("Not starting background task, still running.")
+        logger.warn("Instead, we just restart the service. It's about time")
+        os.system("systemctl restart gb-relay")
+        time.sleep(10)
+        logger.warn("Still alive")
+        return
     is_running = True
     logger.info("Starting background task")
 
     chats = settings.get('chats')
     for chat in chats:
         logger.info("Checking "+chat['name'])
-        if await is_player_online(chat['playerid']):
+        team_id = chat['teamid']
+        ignore_online = chat.get('ignore_online',0)
+        if not ignore_online and await is_player_online(chat['playerid'], team_id):
             continue
         sock = await connect_as(chat['email'], chat['pass'])
         if not sock:
             logger.error("Could not log in as "+chat['name'])
             continue
 
-        team_id = chat['teamid']
         channel = await client.fetch_channel(chat['channel'])
         if not channel:
             logger.error("Could not retrieve channel id "+chat['channel'])
@@ -432,6 +473,7 @@ async def check_chats():
                 pid, pname = await get_player_by_id_or_string(sock, team_id, reply)
                 if not pid:
                     continue
+                logger.info("Sending warning to "+pname+" "+pid)
                 await warn_and_demote(sock, team_id, pname, pid, "") #TODO: implement complainer
             elif author == "red":
                 pid, pname = await get_player_by_id_or_string(sock, team_id, reply)
@@ -447,7 +489,7 @@ async def check_chats():
                 pid, pname = await get_player_by_id_or_string(sock, team_id, author[1:])
                 if not pid:
                     continue
-                if await is_player_online(pid):
+                if await is_player_online(pid, team_id):
                     await sock.send(json.dumps( {
                        "@class": ".SendTeamChatMessageRequest",
                        "teamId": team_id,
@@ -524,12 +566,22 @@ async def check_chats():
 
             author = line['who']
             #chattime = time.ctime(line['when']/1000) - not that necessary anymore
-            to_discord = "**{}**".format(postmsg)
+            to_discord = "{}".format(postmsg)
 
-            # use webhooks for impersonation
-            temp_webhook = await channel.create_webhook(name = "hook-"+author)
-            await temp_webhook.send(to_discord, username=line['who'])
-            await temp_webhook.delete()
+            # use webhook for impersonation - test: do not delete after use
+            webhooks = await channel.webhooks()
+            temp_webhook = None
+            hook_name = 'gb-'+str(channel.id)
+            for hook in webhooks:
+                if hook.name == hook_name:
+                    temp_webhook = hook
+                    break
+            if not temp_webhook:
+                temp_webhook = await channel.create_webhook(name = hook_name)
+            colour = int(chat.get('colour', '0xffffff'), 16)
+            embed = discord.Embed(colour=colour, description=to_discord)
+            await temp_webhook.send(embed=embed, username=line['who'])
+            #await temp_webhook.delete()
 
             if chatmsg['type']=='join':
                  time.sleep(0.1)
@@ -537,7 +589,6 @@ async def check_chats():
 
             last_posted_message[team_id] = line['when']
             state['last_posted_message'] = last_posted_message
-            print("Last posted message is kept")
             keep_state()
 
             if not chat.get('read_only'):
@@ -680,11 +731,15 @@ Found {} ongoing match{}:
         edited = False
         status_message = state.get('status_message',{}).get(team_id)
         if status_message:
-            message = await channel.fetch_message(status_message)
-            if message:
-                await message.edit(content=status_info)
-                edited = True
-                time.sleep(5) # avoid some rate limiting
+            try:
+                message = await channel.fetch_message(status_message)
+                if message:
+                    await message.edit(content=status_info)
+                    edited = True
+                    time.sleep(5) # avoid some rate limiting
+            except:
+                # that's ok, we don't need to have it
+                pass
         if not edited:
             message = await channel.send(status_info)
             messages = state.get('status_message',{})
