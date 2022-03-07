@@ -74,7 +74,10 @@ async def on_message(message):
              ],
              guild_ids = settings.get('guild_ids',[]))
 async def reply(ctx, reply):
-    await ctx.defer()
+    try:
+        await ctx.defer()
+    except:
+        pass
     await send_reply(ctx.channel.id, ctx.author.display_name, reply)
     await ctx.send(reply+"\nYour reply was queued and will be sent during the next relay.", delete_after=60.0)
 
@@ -96,7 +99,10 @@ async def reply(ctx, reply):
              ],
              guild_ids = settings.get('guild_ids',[]))
 async def notify(ctx, player, message):
-    await ctx.defer()
+    try:
+        await ctx.defer()
+    except:
+        pass
     await send_notify(ctx.channel.id, ctx.author.display_name, player, message)
     await ctx.send(message+"\nYour notification was queued and will be sent when the player is online.", delete_after=60.0)
 
@@ -112,7 +118,10 @@ async def notify(ctx, player, message):
              ],
              guild_ids = settings.get('guild_ids',[]))
 async def announce(ctx, message):
-    await ctx.defer()
+    try:
+        await ctx.defer()
+    except:
+        pass
     for chat in settings.get('chats',[]):
         if chat.get('read_only'):
             continue
@@ -134,7 +143,10 @@ async def yellowcard(ctx, player):
     if str(ctx.author) not in admins:
         await ctx.send("You are not allowed to issue this command.", delete_after=300.0)
     else:
-        await ctx.defer()
+        try:
+            await ctx.defer()
+        except:
+            pass
         await store_warning(ctx.channel.id, player)
         await ctx.send("Your warning was queued and will be sent during the next relay.", delete_after=60.0)
 
@@ -153,7 +165,10 @@ async def redcard(ctx, player):
     if str(ctx.author) not in admins:
         await ctx.send("You are not allowed to issue this command.", delete_after=300.0)
     else:
-        await ctx.defer()
+        try:
+            await ctx.defer()
+        except:
+            pass
         await store_redcard(ctx.channel.id, player)
         await ctx.send("Your boot request was queued and will be sent during the next relay.", delete_after=60.0)
 
@@ -172,7 +187,10 @@ async def boot(ctx, player):
     if str(ctx.author) not in admins:
         await ctx.send("You are not allowed to issue this command.", delete_after=300.0)
     else:
-        await ctx.defer()
+        try:
+            await ctx.defer()
+        except:
+            pass
         await store_boot(ctx.channel.id, player)
         await ctx.send("Your boot request was queued and will be sent during the next relay.", delete_after=60.0)
 
@@ -285,6 +303,7 @@ async def is_player_online(player_id, team_id):
             #        logger.info(player_id+" just hopped in during the last five minutes")
             #else:
             #    logger.info(player_id+" is not online.")
+            logger.info(player_id+" is online: "+str(online))
             return online
 
     logger.warn("Player {} not found in team data.".format(player_id))
@@ -472,22 +491,26 @@ async def check_chats():
             if author == "yellow":
                 pid, pname = await get_player_by_id_or_string(sock, team_id, reply)
                 if not pid:
+                    await channel.send("Could not find player by string '{}'.".format(reply))
                     continue
                 logger.info("Sending warning to "+pname+" "+pid)
                 await warn_and_demote(sock, team_id, pname, pid, "") #TODO: implement complainer
             elif author == "red":
                 pid, pname = await get_player_by_id_or_string(sock, team_id, reply)
                 if not pid:
+                    await channel.send("Could not find player by string '{}'.".format(reply))
                     continue
                 await boot_and_block(sock, team_id, pid)
             elif author == "boot":
                 pid, pname = await get_player_by_id_or_string(sock, team_id, reply)
                 if not pid:
+                    await channel.send("Could not find player by string '{}'.".format(reply))
                     continue
                 await boot_player(sock, team_id, pid)
             elif author[0] == "!":
                 pid, pname = await get_player_by_id_or_string(sock, team_id, author[1:])
                 if not pid:
+                    await channel.send("Could not find player by string '{}'.".format(author[1:]))
                     continue
                 if await is_player_online(pid, team_id):
                     await sock.send(json.dumps( {
@@ -644,7 +667,10 @@ async def check_chats():
 
             mid = data.get('requestId')
             if mid in matches:
-                data = data.get('scriptData').get('data')
+                data = data.get('scriptData',{}).get('data')
+                if not data:
+                    logger.error("Could not spectate match. Aborting")
+                    break
                 peerid = bytes(data.get('serverip'), 'utf-8')
                 port = data.get('serverport')
                 auth_token = data.get('spectatortoken').encode()
@@ -712,7 +738,10 @@ async def check_chats():
                                 # ignore any other packets. They are pings and OKs.
                                 continue
 
-            del matches[mid]
+            try:
+                del matches[mid]
+            except:
+                pass
             if len(matches)==0:
                 break
 
