@@ -51,6 +51,7 @@ tbd.
             "pass": ...,
             "channel": ...,
             "read_only": True|False
+            "ignore_online": True|False
         },
         ...
     ]
