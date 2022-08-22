@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+from contextlib import suppress
 import discord
 from discord.ext import tasks, commands
 from discord_slash import SlashCommand, SlashContext
@@ -17,8 +18,8 @@ import requests
 import time
 import sys
 
-def log_setup():
-    log_handler = logging.handlers.WatchedFileHandler('/var/log/gb-relay.log')
+def log_setup(settings):
+    log_handler = logging.handlers.WatchedFileHandler(settings.get('logfile'))
     formatter = logging.Formatter(
         '%(asctime)s program_name [%(process)d]: %(message)s',
         '%b %d %H:%M:%S')
@@ -30,15 +31,19 @@ def log_setup():
 
 command_token="!"
 
-log_setup()
-logger = logging.getLogger(name="gb-relay")
-
 settings = json.load(open('.settings','r'))
 state = json.load(open('.state','r'))
+teamoverride = json.load(open('teamoverrides.json', 'r'))
+fullconfig = json.load(open('cardconfig.json', 'r'))
+
+log_setup(settings)
+logger = logging.getLogger(name="gb-relay")
 
 gb_entryURL = settings.get('entry_url')
 hmac_key = bytes(settings.get('hmac_key',''), 'utf-8')
 admins = settings.get('admins')
+
+relogins = 0
 
 is_running = False
 RATE_LIMIT = 120
@@ -74,12 +79,11 @@ async def on_message(message):
              ],
              guild_ids = settings.get('guild_ids',[]))
 async def reply(ctx, reply):
-    try:
+    with suppress(Exception):
         await ctx.defer()
-    except:
-        pass
     await send_reply(ctx.channel.id, ctx.author.display_name, reply)
-    await ctx.send(reply+"\nYour reply was queued and will be sent during the next relay.", delete_after=60.0)
+    with suppress(Exception):
+        await ctx.send(reply+"\nYour reply was queued and will be sent during the next relay.", delete_after=60.0)
 
 @slash.slash(name = "notify",
              description = "Notify a player when they are online.",
@@ -99,12 +103,11 @@ async def reply(ctx, reply):
              ],
              guild_ids = settings.get('guild_ids',[]))
 async def notify(ctx, player, message):
-    try:
+    with suppress(Exception):
         await ctx.defer()
-    except:
-        pass
     await send_notify(ctx.channel.id, ctx.author.display_name, player, message)
-    await ctx.send(message+"\nYour notification was queued and will be sent when the player is online.", delete_after=60.0)
+    with suppress(Exception):
+        await ctx.send(message+"\nYour notification was queued and will be sent when the player is online.", delete_after=60.0)
 
 @slash.slash(name = "announce",
              description = "Send a reply to the ingame chat of all teams.",
@@ -118,15 +121,14 @@ async def notify(ctx, player, message):
              ],
              guild_ids = settings.get('guild_ids',[]))
 async def announce(ctx, message):
-    try:
+    with suppress(Exception):
         await ctx.defer()
-    except:
-        pass
     for chat in settings.get('chats',[]):
         if chat.get('read_only'):
             continue
         await send_reply(chat.get('channel'), ctx.author.display_name, message)
-    await ctx.send(message+"\nYour announcement was queued and will be sent during the next relay.", delete_after=60.0)
+    with suppress(Exception):
+        await ctx.send(message+"\nYour announcement was queued and will be sent during the next relay.", delete_after=60.0)
 
 @slash.slash(name = "yellowcard",
              description = "Warn and demote a player / issue a yellow card.",
@@ -143,12 +145,11 @@ async def yellowcard(ctx, player):
     if str(ctx.author) not in admins:
         await ctx.send("You are not allowed to issue this command.", delete_after=300.0)
     else:
-        try:
+        with suppress(Exception):
             await ctx.defer()
-        except:
-            pass
         await store_warning(ctx.channel.id, player)
-        await ctx.send("Your warning was queued and will be sent during the next relay.", delete_after=60.0)
+        with suppress(Exception):
+            await ctx.send("Your warning was queued and will be sent during the next relay.", delete_after=60.0)
 
 @slash.slash(name = "redcard",
              description = "Boot and block a player / issue a red card.",
@@ -165,12 +166,11 @@ async def redcard(ctx, player):
     if str(ctx.author) not in admins:
         await ctx.send("You are not allowed to issue this command.", delete_after=300.0)
     else:
-        try:
+        with suppress(Exception):
             await ctx.defer()
-        except:
-            pass
         await store_redcard(ctx.channel.id, player)
-        await ctx.send("Your boot request was queued and will be sent during the next relay.", delete_after=60.0)
+        with suppress(Exception):
+            await ctx.send("Your boot request was queued and will be sent during the next relay.", delete_after=60.0)
 
 @slash.slash(name = "boot",
              description = "Boot a player without issuing a block.",
@@ -187,12 +187,11 @@ async def boot(ctx, player):
     if str(ctx.author) not in admins:
         await ctx.send("You are not allowed to issue this command.", delete_after=300.0)
     else:
-        try:
+        with suppress(Exception):
             await ctx.defer()
-        except:
-            pass
         await store_boot(ctx.channel.id, player)
-        await ctx.send("Your boot request was queued and will be sent during the next relay.", delete_after=60.0)
+        with suppress(Exception):
+            await ctx.send("Your boot request was queued and will be sent during the next relay.", delete_after=60.0)
 
 # queue messages for delivery
 async def send_reply(channel, author, reply):
@@ -244,7 +243,6 @@ async def connect_as(user, passwd):
         "password": passwd,
         "scriptData": {"game_version": 9999, "client_version": 99999},
         "requestId": "_auth"}))
-    # TODO: detect if login fails
 
     return sock
 
@@ -267,6 +265,8 @@ async def is_player_online(player_id, team_id):
             info = json.loads(await sock.recv())
             if info.get('requestId')==player_id:
                 break
+            else:
+                pass
 
         if not 'scriptData' in info:
             logger.error("Cannot retrieve player info.")
@@ -308,7 +308,6 @@ async def is_player_online(player_id, team_id):
 
     logger.warn("Player {} not found in team data.".format(player_id))
     return False
-
 
 # welcome or ban people
 welcomed={}
@@ -455,6 +454,7 @@ async def watch(sock, match):
 @tasks.loop(seconds=RATE_LIMIT)
 async def check_chats():
     global is_running
+    global relogins
 
     if is_running:
         logger.warn("Not starting background task, still running.")
@@ -468,19 +468,44 @@ async def check_chats():
 
     chats = settings.get('chats')
     for chat in chats:
+        player_info = None
+        team_info = None
+
         logger.info("Checking "+chat['name'])
         team_id = chat['teamid']
         ignore_online = chat.get('ignore_online',0)
         if not ignore_online and await is_player_online(chat['playerid'], team_id):
             continue
+
+        channel = await client.fetch_channel(chat['channel'])
+        if not channel:
+            logger.error("Could not retrieve channel id "+chat['channel'])
+            continue
+
+        # login main account
         sock = await connect_as(chat['email'], chat['pass'])
         if not sock:
             logger.error("Could not log in as "+chat['name'])
             continue
 
-        channel = await client.fetch_channel(chat['channel'])
-        if not channel:
-            logger.error("Could not retrieve channel id "+chat['channel'])
+        # TODO: gather player data and card packs from script messages
+        authenticated = False
+        while True:
+            data = json.loads(await sock.recv())
+            if data.get('extCode')=="PLAYER_DATA_UPDATE":
+                player_info = data.get('data')
+            if data.get('extCode')=="UPDATE_DEALS":
+                pass
+            if data.get('extCode')=="STAR_PASS_SEASON_DATA":
+                pass
+            if data.get('extCode')=="CHALLENGE_EVENT_DATA":
+                pass
+            if data.get('@class')==".AuthenticationResponse":
+                if data.get('userId'):
+                    authenticated = True
+                    break
+        if not authenticated:
+            logger.error("Could not authenticate.")
             continue
 
         messages = state.get('queued_messages',{}).get(str(channel.id),[])
@@ -619,8 +644,7 @@ async def check_chats():
                 logger.info("promoting or banning {}.".format(join))
                 await welcome_and_promote(sock, team_id, join, joined[join])
 
-
-        # TODO: get team activity
+        # get team activity
         request = json.dumps({
             "@class": ".LogEventRequest",
             "team_id": team_id,
@@ -637,8 +661,9 @@ async def check_chats():
             data=json.loads(message)
 
             if data.get('requestId')=="gtr":
-                team_name=data.get('scriptData',{}).get('teamName','')
-                members=data.get('scriptData',{}).get('members')
+                team_data = data.get('scriptData',{})
+                team_name = team_data.get('teamName','')
+                members = team_data.get('members')
                 for mem in members:
                     pid = mem.get('id')
                     name = mem.get('displayName')
@@ -686,7 +711,7 @@ async def check_chats():
                 event = host.service(1000)
                 #should be TYPE_CONNECT
                 if event.type != enet.EVENT_TYPE_CONNECT:
-                    print("{}: NOT CONNECTED".format(event.peer.address))
+                    logger.info("NOT CONNECTED")
                 else:
                     logger.info("Spectating to get info.")
 
@@ -777,9 +802,115 @@ Found {} ongoing match{}:
             keep_state()
             time.sleep(5) # avoid some rate limiting
 
+        logger.info("Checking sales.")
+        if not player_info:
+            logger.info(" \ Account was online - skipped")
+            # this happens when the account is already online.
+            relogins += 1
+            pass
+
+        if player_info and team_data:
+            if await can_sell_cards(sock, player_info):
+                logger.info("Selling.")
+                await sell_cards(sock, player_info, team_data)
+            else:
+                logger.info("Cannot sell yet.")
+
+        await sock.send(json.dumps({ "@class": ".EndSessionRequest" }))
         logger.info("Finished checking "+chat['name'])
     logger.info("Finished background task.")
+
     is_running = False
 
+
+async def can_sell_cards(sock, playerdata):
+    # checking free slot
+    if playerdata['serverTime'] > playerdata['scriptData']['freepack']['available_time']:
+        logger.info('opening freepack')
+        await sock.send(json.dumps({ 
+            "@class": ".LogEventRequest", 
+            "eventKey": "OPEN_FREE_PACK", 
+            "requestId": 'free'
+        }))
+        # claim free stuff, link to star pack to reduce frequency
+        await sock.send(json.dumps({
+            "@class": ".LogEventRequest", 
+            "eventKey": "CLAIM_VIDEO_REWARD_PRIZE", 
+            "requestId": 'video'
+        }))
+    # checking star slot
+    if playerdata['serverTime'] > playerdata['scriptData']['pinpack']['available_time'] and \
+       int(playerdata['scriptData']['pinpack']['pin_count']) == 10:
+        logger.info('opening starpack')
+        await sock.send(json.dumps({
+            "@class": ".LogEventRequest", 
+            "eventKey": "OPEN_PIN_PACK", 
+            "requestId": 'pin'
+        }))
+
+    for slot in range(1, 5):
+        if playerdata['scriptData']['slot%d' % (slot)]['available_time'] == None and \
+           playerdata['scriptData']['slot%d' % (slot)]['type'] == 11:
+            logger.info('opening slot {}'.format(slot))
+            await sock.send(json.dumps({"@class": ".LogEventRequest", "eventKey": "SLOT_OPEN_PACK", "SLOT_NUM": slot,
+                                        "requestId": 'slot11'}))
+        elif playerdata['serverTime'] > playerdata['scriptData']['slot%d' % (slot)]['available_time'] and int(
+             playerdata['scriptData']['slot%d' % (slot)]['unlocking']) == 1:
+            logger.info('opening slot {}'.format(slot))
+            await sock.send(json.dumps({"@class": ".LogEventRequest", "eventKey": "SLOT_OPEN_PACK", "SLOT_NUM": slot,
+                                        "requestId": 'slot'}))
+
+    if playerdata['serverTime'] > playerdata['scriptData']['tokenTime']:
+        return True
+    return False
+
+# TODO: clean up, this is copy and paste from the card seller bot
+async def sell_cards(sock, playerdata, teamdata):
+    teamcards = {}
+    for hat in teamdata['teamCards']['hat']:
+        teamcards['hats_' + hat] = teamdata['teamCards']['hat'][hat]['count']
+    for golfer in teamdata['teamCards']['golfer']:
+        teamcards['golfers_' + golfer] = teamdata['teamCards']['golfer'][golfer]['count']
+
+    playerlevel = int(playerdata['scriptData']['data']['level'])
+    sellabletypes = []
+    for cardtype,tokenvalue in fullconfig['tokenvalues'].items():
+        if tokenvalue <= fullconfig['salelevels'][str(playerlevel)]:
+            sellabletypes.append(cardtype)
+    foundcardtosell = False
+
+    sortedteamcards = sorted(teamcards.items(), key=lambda x: x[1])
+    for teamcard in sortedteamcards:
+        teamcardtype = teamcard[0].split('_')[0]
+        teamcardid = teamcard[0].split('_')[1]
+        if teamcardid in playerdata['scriptData']['data'][teamcardtype]:
+            cardtype = 'XXX'
+            cardlimit = 6500
+            if teamcardid in fullconfig[teamcardtype]:
+                cardtype = fullconfig[teamcardtype][teamcardid]
+            if cardtype in sellabletypes:
+                if cardtype in fullconfig['cardlimits']:
+                    cardlimit = fullconfig['cardlimits'][cardtype]
+                    salecount = int(fullconfig['salelevels'][str(playerlevel)] / fullconfig['tokenvalues'][cardtype])
+                    if (playerdata['scriptData']['data'][teamcardtype][teamcardid][
+                            'level'] > 0 and
+                        playerdata['scriptData']['data'][teamcardtype][teamcardid][
+                            'count'] > salecount) or \
+                            playerdata['scriptData']['data'][teamcardtype][teamcardid][
+                                'count'] >= cardlimit + salecount:
+                        saletype = teamcardtype[:-1]
+                        saleitem = int(teamcardid)
+                        foundcardtosell = True
+                        break
+    if foundcardtosell:
+        logger.info("Selling: {} {} {}".format(saletype, saleitem, salecount))
+        await sock.send(json.dumps({
+          "@class": ".LogEventRequest",
+            "eventKey": "TRADE_SELL_CARD",
+            "CARD_TYPE": saletype,
+            "CARD_ID": saleitem,
+            "COUNT": int(salecount),
+            "requestId": "sellcard"
+        }))
 
 client.run(settings.get('token'))
