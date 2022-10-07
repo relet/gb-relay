@@ -70,9 +70,9 @@ def handle_response_login(rdata):
 
 def send_request(message, response_handler=dump_response):
     global PACKET_ID
-    data = gen_data(message)
-    headers = get_headers(data)
-    r = requests.post(BRAIN_URL, headers=headers, json=data)
+    req = gen_data(message)
+    headers = get_headers(req)
+    r = requests.post(BRAIN_URL, headers=headers, json=req)
     PACKET_ID += 1
 
     if (r.status_code != 200):
@@ -89,6 +89,8 @@ def send_request(message, response_handler=dump_response):
         if (r.get("status") != 200):
             print("Error: Request failed")
             print(r.get("status_message"))
+            print("REQUEST")
+            print(json.dumps(req, indent=2))
             sys.exit(1)
 
         rdata = r.get("data")
@@ -140,7 +142,7 @@ def send_chat_message(teamId, message):
             "msg": message,
             "type": "chat"
           },
-          "text": message
+          "text": "message"
         },
         "recordInHistory": True
       },
@@ -204,6 +206,18 @@ def get_team_members(teamId):
     responses = send_request(script_message)
     return responses[0]
 
+def get_team_chat(teamId):
+    script_message = {
+        "data": {
+            "channelId": GAME_ID + ":gr:" + teamId,
+            "maxReturn": 100,
+        },
+        "operation": "GET_RECENT_CHAT_MESSAGES",
+        "service": "chat"
+    }
+    responses = send_request(script_message)
+    return responses[0].get("messages")
+
 def get_player_info(playerId):
     script_message = {
         "data": {
@@ -223,7 +237,7 @@ def is_player_online(playerId, teamId=None):
         data = get_player_info(playerId)
         teamId = data.get("response", {}).get("player_public_data", {}).get("data", {}).get("team_id")
 
-    # I think we cannot tell if the player doesn't have a team
+    # I think we cannot say anything if the player doesn't have a team
     if not teamId:
         return False
 
@@ -232,11 +246,44 @@ def is_player_online(playerId, teamId=None):
         if memberId == playerId:
             return memberData.get("customData",{}).get("online", False)
 
+def sell_card(cardId, cardType, count):
+    script_message = {
+        "data": {
+            "scriptData": {
+                "CARD_ID": cardId,
+                "CARD_TYPE": cardType,
+                "COUNT": count,
+            },
+            "scriptName": "teams/TRADE_SELL_CARD",
+        },
+        "operation": "RUN",
+        "service": "script"
+    }
+    responses = send_request(script_message)
+    return responses[0]
+
+def buy_card(cardId, cardType, count):
+    script_message = {
+        "data": {
+            "scriptData": {
+                "CARD_ID": cardId,
+                "CARD_TYPE": cardType,
+                "COUNT": count,
+            },
+            "scriptName": "teams/TRADE_BUY_CARD",
+        },
+        "operation": "RUN",
+        "service": "script"
+    }
+    responses = send_request(script_message)
+    return responses[0]
+
 if __name__=="__main__":
   # EXAMLE USAGE
   # LOGIN
-  player_data = login(settings["email"], settings["password"])
+  player_data = login(sys.argv[1], sys.argv[2])
   print(json.dumps(player_data, indent=2))
 
   # SEND A REQUEST
-  print(json.dumps(is_player_online(player_data.get("playerId")), indent=2))
+  #print(json.dumps(is_player_online(player_data.get("playerId")), indent=2))
+  #print(json.dumps(get_team_chat(player_data.get("teamId")), indent=2))

@@ -3,6 +3,7 @@
 import asyncio
 import base64
 from contextlib import suppress
+from sqlite3 import connect
 import discord
 from discord.ext import tasks, commands
 from discord_slash import SlashCommand, SlashContext
@@ -13,10 +14,11 @@ import hmac
 import hashlib
 import logging
 import logging.handlers
-import websockets
+#import websockets
 import requests
 import time
 import sys
+import os
 
 import botv2 as bot
 
@@ -44,6 +46,9 @@ brain_secret = bytes(settings.get('brain_secret',''), 'utf-8')
 
 admins = settings.get('admins')
 relogins = 0
+
+checker_email = settings.get('checker-email')
+checker_password = settings.get('checker-password')
 
 is_running = False
 RATE_LIMIT = 120
@@ -217,18 +222,9 @@ async def connect_as(user, passwd):
     return bot.login(user, passwd)
     # do we need to handle the reply?
 
-async def is_player_online(player_id, team_id):
-    player_data = connect_as(settings['checker-email'], settings['checker-pass'])
-    if not ok:
-        logger.error("Cannot log in checker account")
-        return
-
-    # todo: check if player is online
-    return False
-
 # welcome or ban people
 welcomed={}
-async def welcome_and_promote(ws, team_id, who, pid):
+async def welcome_and_promote(team_id, who, pid):
     if pid in welcomed:
         logger.info("Refusing to welcome {} twice.".format(who))
         return
@@ -257,7 +253,7 @@ async def welcome_and_promote(ws, team_id, who, pid):
         action="BOOT_PLAYER"
         bot.boot_player(team_id, pid)
 
-async def warn_and_demote(ws, team_id, who, pid, complaint):
+async def warn_and_demote(team_id, who, pid, complaint):
     compl_de = ""
     compl_en = ""
     if complaint:
@@ -276,7 +272,7 @@ another game against one of your team members to get rid of the warning""".forma
     bot.demote_player(team_id, pid)
     logger.info("Sent warning")
 
-async def boot_and_block(sock, team_id, pid):
+async def boot_and_block(team_id, pid):
     redlist = state.get('redlist',[])
     if not pid in redlist:
         redlist.append(str(pid))
@@ -284,7 +280,7 @@ async def boot_and_block(sock, team_id, pid):
     keep_state()
     bot.boot_player(team_id, pid)
 
-async def get_player_by_id_or_string(sock, team_id, search):
+async def get_player_by_id_or_string(team_id, search):
     team = bot.get_team_members(team_id)
     for playerId, data in team.items():
         if search in playerId or search in data['playerName']:
@@ -315,7 +311,8 @@ async def check_chats():
         logger.info("Checking "+chat['name'])
         team_id = chat['teamid']
         ignore_online = chat.get('ignore_online',0)
-        if not ignore_online and await is_player_online(chat['playerid'], team_id):
+        await connect_as(checker_email, checker_password)
+        if not ignore_online and bot.is_player_online(chat['playerid'], team_id):
             continue
 
         channel = await client.fetch_channel(chat['channel'])
@@ -325,17 +322,18 @@ async def check_chats():
 
         # login main account
         player_info = await connect_as(chat['email'], chat['pass'])
+        logger.info("Logged in as "+player_info["playerId"])
+
         if not player_info['sessionId']:
             logger.error("Could not log in as "+chat['name'])
             continue
-
-        # TODO: gather player data and card packs from script messages
-        # fetch player_info
 
         authenticated = 'playerId' in player_info
         if not authenticated:
             logger.error("Could not authenticate.")
             continue
+
+        logger.info("CHECK")
 
         messages = state.get('queued_messages',{}).get(str(channel.id),[])
         new_queue = []
@@ -356,96 +354,70 @@ async def check_chats():
                     continue
                 await boot_and_block(team_id, pid)
             elif author == "boot":
-                pid, pname = await get_player_by_id_or_string(sock, team_id, reply)
+                pid, pname = await get_player_by_id_or_string(team_id, reply)
                 if not pid:
                     await channel.send("Could not find player by string '{}'.".format(reply))
                     continue
-                await boot_player(sock, team_id, pid)
+                bot.boot_player(team_id, pid)
             elif author[0] == "!":
-                pid, pname = await get_player_by_id_or_string(sock, team_id, author[1:])
+                pid, pname = await get_player_by_id_or_string(team_id, author[1:])
                 if not pid:
                     await channel.send("Could not find player by string '{}'.".format(author[1:]))
                     continue
                 if await is_player_online(pid, team_id):
-                    await sock.send(json.dumps( {
-                       "@class": ".SendTeamChatMessageRequest",
-                       "teamId": team_id,
-                       "message": json.dumps({"type":"chat", "msg": reply}),
-                       "requestId": "reply"
-                    }))
+                    bot.send_chat_message(team_id, reply)
                 else:
                     new_queue.append(msg)
             else:
-                await sock.send(json.dumps( {
-                    "@class": ".SendTeamChatMessageRequest",
-                    "teamId": team_id,
-                    "message": json.dumps({"type":"chat", "msg": "{}\n{}".format(author, reply)}),
-                    "requestId": "reply"
-                }))
+                bot.send_chat_message(team_id, "{}\n{}".format(author, reply))
 
         state['queued_messages']=state.get('queued_messages',{})
         state['queued_messages'][str(channel.id)]=new_queue
         keep_state()
 
-        await sock.send(json.dumps({
-            "@class": ".ListTeamChatRequest",
-            "entryCount": 100,
-            "requestId": team_id,
-            "teamId": team_id
-        }))
+        messages = bot.get_team_chat(team_id)
 
-        while True:
-            data = json.loads(await sock.recv())
-            if data.get('requestId')==team_id:
-                break
-        if not 'messages' in data:
-            logger.error("Could not receive messages via "+chat['name'])
-            continue
-
-        lines = []
-
+        to_handle = []
         last_posted_message=state.get('last_posted_message', {})
         newest = last_posted_message.get(team_id,0)
 
-        for line in data['messages']:
-            if line['when'] <= newest:
+        # todo, use a filter instead
+        for message in messages:
+            if message['date'] <= newest:
                 continue
-            lines = lines+[line]
-        lines.sort(key=lambda x:x['when'])
+            to_handle.append(message)
+        to_handle.sort(key=lambda x: x['date'], reverse=False)
 
         joined={}
-        for line in lines:
-            chatmsg = json.loads(line['message'])
-            postmsg = chatmsg['msg']
+        for message in to_handle:
+            chatmsg = message.get('content',{}).get('message')
+            postmsg = chatmsg.get('msg')
+            when = message.get('date')
+            author = message.get("from",{}).get("name")
+            authorId = message.get("from",{}).get("id")
+
             if chatmsg['type']=='leave':
                 postmsg = chatmsg['msg']+' left the team.'
                 if chatmsg['msg'] in joined:
-                    for key, value in dict(joined).items():
-                        if value==chatmsg['msg']:
-                            del joined[key]
+                   del joined[chatmsg['msg']]
             if chatmsg['type']=='promote':
-                postmsg = line['who']+' has promoted '+chatmsg['promoted']+"."
+                postmsg = chatmsg['promoter']+' has promoted '+chatmsg['promoted']+"."
                 if chatmsg['promoted'] in joined:
-                    #todo: actually just send the message, but don't promote.
-                    for key, value in dict(joined).items():
-                        if value==chatmsg['promoted']:
-                            del joined[key]
+                    del joined[chatmsg['promoted']]
             if chatmsg['type']=='demote':
-                postmsg = line['who']+' has demoted '+chatmsg['demoted']+"."
+                postmsg = chatmsg['demoter']+' has demoted '+chatmsg['demoted']+"."
             if chatmsg['type']=='boot':
-                postmsg = line['who']+' has booted '+chatmsg['booted']+"."
+                postmsg = author+' has booted '+chatmsg['booted']+"."
             if chatmsg['type']=='join':
-                postmsg = chatmsg['msg']+' joined the team. (player id: '+line['fromId']+')'
-                joined[chatmsg['msg']]=line['fromId']
+                postmsg = author+' joined the team. (player id: '+message.get("from",{}).get("id")+')'
+                joined[author]=authorId
             if chatmsg['type']=='friendly_match':
                 continue
-                postmsg = line['who']+' started a friendly match.'
+                #postmsg = author+' started a friendly match.'
 
-            author = line['who']
-            #chattime = time.ctime(line['when']/1000) - not that necessary anymore
             to_discord = "{}".format(postmsg)
 
-            # use webhook for impersonation - test: do not delete after use
+            # use webhook for impersonation
             webhooks = await channel.webhooks()
             temp_webhook = None
             hook_name = 'gb-'+str(channel.id)
@@ -457,289 +429,25 @@ async def check_chats():
                 temp_webhook = await channel.create_webhook(name = hook_name)
             colour = int(chat.get('colour', '0xffffff'), 16)
             embed = discord.Embed(colour=colour, description=to_discord)
-            await temp_webhook.send(embed=embed, username=line['who'])
-            #await temp_webhook.delete()
+            await temp_webhook.send(embed=embed, username=author)
 
             if chatmsg['type']=='join':
                  time.sleep(0.1)
-                 await channel.send("?playerinfo -id "+line['fromId'])
+                 await channel.send("?playerinfo -id "+authorId)
 
-            last_posted_message[team_id] = line['when']
+            last_posted_message[team_id] = when
             state['last_posted_message'] = last_posted_message
             keep_state()
 
             if not chat.get('read_only'):
               for join in set(joined.keys()):
                 logger.info("promoting or banning {}.".format(join))
-                await welcome_and_promote(sock, team_id, join, joined[join])
+                await welcome_and_promote(team_id, join, joined[join])
 
-        # get team activity
-        request = json.dumps({
-            "@class": ".LogEventRequest",
-            "team_id": team_id,
-           "eventKey": "GET_TEAM_REQUEST",
-           "requestId": "gtr"
-        })
-        team_name=""
-        await sock.send(request)
-
-        online = []
-        matches = {}
-        while True:
-            message = await sock.recv()
-            data=json.loads(message)
-
-            if data.get('requestId')=="gtr":
-                team_data = data.get('scriptData',{})
-                team_name = team_data.get('teamName','')
-                members = team_data.get('members')
-                for mem in members:
-                    pid = mem.get('id')
-                    name = mem.get('displayName')
-                    is_online = mem.get('online')
-                    if is_online:
-                        if pid != chat.get('playerid'):
-                            online.append(name)
-                    match = mem.get('scriptData',{}).get('active_match')
-                    if not match:
-                        continue
-                    matches[match]=(pid,name)
-                    await watch(sock, match)
-                break
-
-        channel = await client.fetch_channel(settings['status-channel'])
-        if not channel:
-            logger.error("Could not retrieve status channel id")
-            continue
-
-        matchdata = ""
-        num_matches = len(matches)
-
-        while len(matches)>0:
-            message = await sock.recv()
-            data=json.loads(message)
-
-            mid = data.get('requestId')
-            if mid in matches:
-                data = data.get('scriptData',{}).get('data')
-                if not data:
-                    logger.error("Could not spectate match. Aborting")
-                    break
-                peerid = bytes(data.get('serverip'), 'utf-8')
-                port = data.get('serverport')
-                auth_token = data.get('spectatortoken').encode()
-
-                host = enet.Host(peerCount = 1)
-                peer = host.connect(address=enet.Address(peerid, port), channelCount=2)
-
-                #spectate a match match
-
-                msg = bytes.fromhex('0122') + bytes([len(auth_token)]) + bytearray(auth_token)
-                packet = enet.Packet(data=msg, flags=enet.PACKET_FLAG_RELIABLE)
-
-                event = host.service(1000)
-                #should be TYPE_CONNECT
-                if event.type != enet.EVENT_TYPE_CONNECT:
-                    logger.info("NOT CONNECTED")
-                else:
-                    logger.info("Spectating to get info.")
-
-                    success = peer.send(0, packet)
-                    ping = peer.ping()
-
-                    while True:
-                        event = host.service(10000)
-                        if event.type == enet.EVENT_TYPE_DISCONNECT:
-                            break
-                        elif event.type == enet.EVENT_TYPE_RECEIVE:
-                            packet_type = event.packet.data[0]
-                            length = len(event.packet.data)
-
-                            if packet_type == 0x10 and length>100:
-                                #there are some 6 byte packets
-                                data = event.packet.data
-                                prev = 0
-                                pnum = 0
-                                players = {}
-
-                                while pnum<4:
-                                    start = data.find(b'{"player_data":', prev)
-                                    if start<1:
-                                        break
-                                    stop = data.find(b'}}', start)
-                                    stop = data.find(b'}}', stop+2)
-                                    pbytes = data[start:stop+2]
-                                    pjson = pbytes.decode()
-                                    pdata = json.loads(pjson)
-
-                                    pnum = pnum+1
-                                    pid = pdata.get('player_data').get('account_id')
-                                    if pid in players:
-                                        break
-                                    pname = pdata.get('player_data').get('display_name')
-                                    players[pid]=pname
-                                    plevel = pdata.get('player_data').get('level')
-                                    ptrophies = pdata.get('player_data').get('trophies')
-
-                                    matchdata += "> #{} - 🏆{} - {} (L{})\n".format(pnum, ptrophies, pname, plevel)
-                                    prev=stop+1
-
-                                peer.disconnect()
-                                matchdata += "\n"
-                                break
-
-                            else:
-                                # ignore any other packets. They are pings and OKs.
-                                continue
-
-            try:
-                del matches[mid]
-            except:
-                pass
-            if len(matches)==0:
-                break
-
-        # COMPLETE STATUS MESSAGE
-        num_players = len(online)
-        status_info = """__{}__ *updated: {} UTC*
-{} Player{} online: {}.
-Found {} ongoing match{}:
-{}
-
-""".format(team_name[4:], time.ctime(), num_players, (num_players!=1) and "s" or "", ", ".join(online),
-           num_matches, (num_matches != 1) and "es" or "",
-           matchdata)
-        #########################
-
-        edited = False
-        status_message = state.get('status_message',{}).get(team_id)
-        if status_message:
-            try:
-                message = await channel.fetch_message(status_message)
-                if message:
-                    await message.edit(content=status_info)
-                    edited = True
-                    time.sleep(5) # avoid some rate limiting
-            except:
-                # that's ok, we don't need to have it
-                pass
-        if not edited:
-            message = await channel.send(status_info)
-            messages = state.get('status_message',{})
-            messages[team_id] = message.id
-            state['status_message'] = messages
-            keep_state()
-            time.sleep(5) # avoid some rate limiting
-
-        logger.info("Checking sales.")
-        if not player_info:
-            logger.info(" \ Account was online - skipped")
-            # this happens when the account is already online.
-            relogins += 1
-            pass
-
-        if player_info and team_data:
-            if await can_sell_cards(sock, player_info):
-                logger.info("Selling.")
-                await sell_cards(sock, player_info, team_data)
-            else:
-                logger.info("Cannot sell yet.")
-
-        await sock.send(json.dumps({ "@class": ".EndSessionRequest" }))
         logger.info("Finished checking "+chat['name'])
     logger.info("Finished background task.")
 
     is_running = False
 
-
-async def can_sell_cards(sock, playerdata):
-    # checking free slot
-    if playerdata['serverTime'] > playerdata['scriptData']['freepack']['available_time']:
-        logger.info('opening freepack')
-        await sock.send(json.dumps({
-            "@class": ".LogEventRequest",
-            "eventKey": "OPEN_FREE_PACK",
-            "requestId": 'free'
-        }))
-        # claim free stuff, link to star pack to reduce frequency
-        await sock.send(json.dumps({
-            "@class": ".LogEventRequest",
-            "eventKey": "CLAIM_VIDEO_REWARD_PRIZE",
-            "requestId": 'video'
-        }))
-    # checking star slot
-    if playerdata['serverTime'] > playerdata['scriptData']['pinpack']['available_time'] and \
-       int(playerdata['scriptData']['pinpack']['pin_count']) == 10:
-        logger.info('opening starpack')
-        await sock.send(json.dumps({
-            "@class": ".LogEventRequest",
-            "eventKey": "OPEN_PIN_PACK",
-            "requestId": 'pin'
-        }))
-
-    for slot in range(1, 5):
-        if playerdata['scriptData']['slot%d' % (slot)]['available_time'] == None and \
-           playerdata['scriptData']['slot%d' % (slot)]['type'] == 11:
-            logger.info('opening slot {}'.format(slot))
-            await sock.send(json.dumps({"@class": ".LogEventRequest", "eventKey": "SLOT_OPEN_PACK", "SLOT_NUM": slot,
-                                        "requestId": 'slot11'}))
-        elif playerdata['serverTime'] > playerdata['scriptData']['slot%d' % (slot)]['available_time'] and int(
-             playerdata['scriptData']['slot%d' % (slot)]['unlocking']) == 1:
-            logger.info('opening slot {}'.format(slot))
-            await sock.send(json.dumps({"@class": ".LogEventRequest", "eventKey": "SLOT_OPEN_PACK", "SLOT_NUM": slot,
-                                        "requestId": 'slot'}))
-
-    if playerdata['serverTime'] > playerdata['scriptData']['tokenTime']:
-        return True
-    return False
-
-# TODO: clean up, this is copy and paste from the card seller bot
-async def sell_cards(sock, playerdata, teamdata):
-    teamcards = {}
-    for hat in teamdata['teamCards']['hat']:
-        teamcards['hats_' + hat] = teamdata['teamCards']['hat'][hat]['count']
-    for golfer in teamdata['teamCards']['golfer']:
-        teamcards['golfers_' + golfer] = teamdata['teamCards']['golfer'][golfer]['count']
-
-    playerlevel = int(playerdata['scriptData']['data']['level'])
-    sellabletypes = []
-    for cardtype,tokenvalue in fullconfig['tokenvalues'].items():
-        if tokenvalue <= fullconfig['salelevels'][str(playerlevel)]:
-            sellabletypes.append(cardtype)
-    foundcardtosell = False
-
-    sortedteamcards = sorted(teamcards.items(), key=lambda x: x[1])
-    for teamcard in sortedteamcards:
-        teamcardtype = teamcard[0].split('_')[0]
-        teamcardid = teamcard[0].split('_')[1]
-        if teamcardid in playerdata['scriptData']['data'][teamcardtype]:
-            cardtype = 'XXX'
-            cardlimit = 6500
-            if teamcardid in fullconfig[teamcardtype]:
-                cardtype = fullconfig[teamcardtype][teamcardid]
-            if cardtype in sellabletypes:
-                if cardtype in fullconfig['cardlimits']:
-                    cardlimit = fullconfig['cardlimits'][cardtype]
-                    salecount = int(fullconfig['salelevels'][str(playerlevel)] / fullconfig['tokenvalues'][cardtype])
-                    if (playerdata['scriptData']['data'][teamcardtype][teamcardid][
-                            'level'] > 0 and
-                        playerdata['scriptData']['data'][teamcardtype][teamcardid][
-                            'count'] > salecount) or \
-                            playerdata['scriptData']['data'][teamcardtype][teamcardid][
-                                'count'] >= cardlimit + salecount:
-                        saletype = teamcardtype[:-1]
-                        saleitem = int(teamcardid)
-                        foundcardtosell = True
-                        break
-    if foundcardtosell:
-        logger.info("Selling: {} {} {}".format(saletype, saleitem, salecount))
-        await sock.send(json.dumps({
-          "@class": ".LogEventRequest",
-            "eventKey": "TRADE_SELL_CARD",
-            "CARD_TYPE": saletype,
-            "CARD_ID": saleitem,
-            "COUNT": int(salecount),
-            "requestId": "sellcard"
-        }))
 
 client.run(settings.get('token'))
