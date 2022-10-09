@@ -1,9 +1,12 @@
 #!/usr/bin/env python
 
 import sys
+import time
 import hashlib
 import json
+from turtle import update
 import requests
+import random
 
 settings = json.loads(open(".settings", "r").read())
 
@@ -13,6 +16,8 @@ SECRET = settings.get("brain_secret")
 GAME_ID = "13726"
 PACKET_ID = 0
 SESSION_ID = ""
+
+ENTITIES = {}
 
 headers = {
   "Host": "api.braincloudservers.com",
@@ -44,11 +49,13 @@ def get_headers(data):
     return my_headers
 
 def dump_response(rdata):
-    #print(json.dumps(rdata, indent=2))
     return rdata
 
 def handle_response_login(rdata):
     global SESSION_ID
+    global ENTITIES
+
+    open("logindata", "w").write(json.dumps(rdata, indent=2))
 
     entities = rdata.get("entities")
     player_name = rdata.get("playerName")
@@ -57,6 +64,7 @@ def handle_response_login(rdata):
 
     for ent in entities:
         entType = ent.get("entityType")
+        ENTITIES[entType]=ent
         if entType == "public":
             team_id = ent.get("data").get("team_id")
 
@@ -87,16 +95,16 @@ def send_request(message, response_handler=dump_response):
     handled_responses = []
     for r in responses:
         if (r.get("status") != 200):
-            print("Error: Request failed")
-            print(r.get("status_message"))
             print("REQUEST")
             print(json.dumps(req, indent=2))
+            print()
+            print("Error: Request failed")
+            print(r.get("status_message"))
             sys.exit(1)
 
         rdata = r.get("data")
         handled_responses.append(response_handler(rdata))
     return handled_responses
-
 
 def login(email, password):
     login_message = {
@@ -106,7 +114,7 @@ def login(email, password):
         "authenticationType": "Email",
         "clientLib": "cpp",
         "clientLibVersion": "4.12.2",
-        "countryCode": "GB",
+        "countryCode": "US",
         "externalId": email,
         "extraJson": {
           "client_version": 209,
@@ -118,7 +126,7 @@ def login(email, password):
             "password": password,
           }
         },
-        "forceCreate": False,
+        "forceCreate": True,
         "gameId": "13726",
         "gameVersion": "3.0.1 (414)",
         "languageCode": "",
@@ -130,7 +138,6 @@ def login(email, password):
       "service": "authenticationV2"
       }
     responses = send_request(login_message, handle_response_login)
-    #responses = send_request(login_message)
     return responses[0]
 
 def send_chat_message(teamId, message):
@@ -218,6 +225,18 @@ def get_team_chat(teamId):
     responses = send_request(script_message)
     return responses[0].get("messages")
 
+def channel_connect(teamId):
+    script_message = {
+        "data": {
+            "channelId": GAME_ID + ":gr:" + teamId,
+            "maxReturn": 1000
+        },
+        "operation": "CHANNEL_CONNECT",
+        "service": "chat"
+    }
+    responses = send_request(script_message)
+    return responses[0]
+
 def get_player_info(playerId):
     script_message = {
         "data": {
@@ -278,12 +297,130 @@ def buy_card(cardId, cardType, count):
     responses = send_request(script_message)
     return responses[0]
 
-if __name__=="__main__":
-  # EXAMLE USAGE
-  # LOGIN
-  player_data = login(sys.argv[1], sys.argv[2])
-  print(json.dumps(player_data, indent=2))
+def get_card_pool(teamid):
+    card_pool = {'hat':{}, 'golfer': {}}
+    page = 1
+    more_results = True
+    while(more_results):
+        script_message = {
+                 "data": {
+                    "context": {
+                       "pagination": {
+                          "pageNumber": page,
+                          "rowsPerPage": 50
+                       },
+                       "searchCriteria": {
+                          "entityType": "TRADING_CARD",
+                          "groupId": teamid
+                       },
+                       "sortCriteria": {
+                          "data.id": 1
+                       }
+                    }
+                 },
+                 "operation": "READ_GROUP_ENTITIES_PAGE",
+                 "service": "group"
+              }
+        responses = send_request(script_message)
+        page += 1
+        for response in responses:
+            if 'results' in response:
+                if 'moreAfter' in response['results']:
+                    if not response['results']['moreAfter']:
+                        more_results = False
+                if 'items' in response['results']:
+                    for carditem in response['results']['items']:
+                        if int(carditem['data']['id']) in card_pool[carditem['data']['type']]:
+                            print('this card was already found')
+                        card_pool[carditem['data']['type']][int(carditem['data']['id'])] = int(carditem['data']['count'])
+    return responses, card_pool
 
-  # SEND A REQUEST
-  #print(json.dumps(is_player_online(player_data.get("playerId")), indent=2))
-  #print(json.dumps(get_team_chat(player_data.get("teamId")), indent=2))
+def open_pack(packId):
+    request = {
+      "data": {
+        "scriptData": {
+          "slot_num": packId
+        },
+        "scriptName": "packs/OPEN_SLOT_PACK"
+      },
+      "operation": "RUN",
+      "service": "script"
+    }
+    responses = send_request(request)
+    return responses
+
+def get_player_by_friend_code(friendCode):
+    request = {
+      "data": {
+        "scriptData": {
+          "fast_friend_token": "",
+          "friend_code": friendCode
+        },
+        "scriptName": "friends/FRIEND_ADD_FRIEND"
+      },
+      "operation": "RUN",
+      "service": "script"
+    }
+    response = send_request(request)
+    print(json.dumps(response, indent=2))
+    if response[0]["success"] == True:
+        return response[0].get("response").get("targetPlayer")
+    else:
+        return None
+
+def get_player_info(playerId):
+    request = {
+      "data": {
+        "scriptData": {
+          "player_id": playerId
+        },
+        "scriptName": "events/GET_PLAYER_INFO"
+      },
+      "operation": "RUN",
+      "service": "script"
+    }
+    return send_request(request)
+
+def search_teams(search):
+    request = {
+      "data": {
+        "scriptData": {
+          "COUNTRY": "DE",
+          "NAME": search,
+          "REQUIRED_TROPHIES": -1
+        },
+        "scriptName": "teams/TEAM_SEARCH_EVENT"
+      },
+      "operation": "RUN",
+      "service": "script"
+    }
+    return send_request(request)
+
+def download_file(assetId):
+    request = {
+        "data": {
+            "filename": assetId,
+            "folderPath": "/"
+        },
+        "operation": "GET_FILE_INFO_SIMPLE",
+        "service": "globalFileV3"
+    }
+    reply = send_request(request)
+
+    url = reply[0].get("fileDetails").get("url")
+    with requests.get(url) as r:
+        with open(assetId+".zip", 'wb') as f:
+            for chunk in r.iter_content(chunk_size=8192):
+                f.write(chunk)
+    return True
+
+if __name__=="__main__":
+    # EXAMLE USAGE
+    # LOGIN
+    player_data = login(sys.argv[1], sys.argv[2])
+    print(json.dumps(player_data, indent=2))
+    # GET MEMBERS OF PLAYER TEAM
+    teamId = player_data.get("teamId")
+    teammates = get_team_members(teamId)
+    print(json.dumps(teammates, indent=2))
+    sys.exit(1)
