@@ -4,7 +4,6 @@ import sys
 import time
 import hashlib
 import json
-from turtle import update
 import requests
 import random
 
