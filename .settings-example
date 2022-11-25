@@ -1,9 +1,9 @@
 {
-    "entry_url": "...",
-    "hmac_key": "...",
     "admins": ["..."],
     "guild_ids": [integer],
-    "token": "...your token here...",
+    "brain_url": "...",
+    "brain_secret": "...",
+    "token": "...",
     "checker-email":"account email",
     "checker-pass":"account password",
     "chats": [

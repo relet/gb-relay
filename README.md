@@ -35,11 +35,11 @@ tbd.
 tbd.
 ```
 {
-    "entry_url": "...",
-    "hmac_key": "...",
+    "token": "...",
+    "brain_url": "...",
+    "brain_secret": "...",
     "admins": ["..."],
     "guild_ids": [integer],
-    "token": "...your token here...",
     "checker-email":"account email",
     "checker-pass":"account password",
     "chats": [
