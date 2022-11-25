@@ -1,26 +1,19 @@
 #!/usr/bin/env python3
 
-import asyncio
-import base64
 from contextlib import suppress
-from sqlite3 import connect
 import discord
 from discord.ext import tasks, commands
-from discord_slash import SlashCommand, SlashContext
+from discord_slash import SlashCommand
 from discord_slash.utils.manage_commands import create_option
-import enet
 import json
-import hmac
-import hashlib
 import logging
 import logging.handlers
-#import websockets
-import requests
 import time
-import sys
 import os
 
 import botv2 as bot
+
+print("Starting GB Discord bot.")
 
 def log_setup(settings):
     log_handler = logging.handlers.WatchedFileHandler(settings.get('logfile'))
@@ -59,8 +52,12 @@ def keep_state():
     fd.close()
     logger.info("State stored.")
 
-client = commands.Bot(command_prefix='%')
+print("Configuration finished. Logging to log file.")
+
+client = commands.Bot(command_prefix=None)
 slash = SlashCommand(client, sync_commands=True)
+
+print("Ready.")
 
 @client.event
 async def on_ready():
@@ -70,6 +67,7 @@ async def on_ready():
 @client.event
 async def on_message(message):
     return
+
 
 @slash.slash(name = "reply",
              description = "Send a reply to the ingame chat.",
@@ -312,7 +310,8 @@ async def check_chats():
         team_id = chat['teamid']
         ignore_online = chat.get('ignore_online',0)
         await connect_as(checker_email, checker_password)
-        if not ignore_online and bot.is_player_online(chat['playerid'], team_id):
+        if not ignore_online and bot.is_player_online(chat['playerid']):
+            logger.info("Player is online, skipping")
             continue
 
         channel = await client.fetch_channel(chat['channel'])
@@ -364,7 +363,7 @@ async def check_chats():
                 if not pid:
                     await channel.send("Could not find player by string '{}'.".format(author[1:]))
                     continue
-                if await is_player_online(pid, team_id):
+                if await is_player_online(pid):
                     bot.send_chat_message(team_id, reply)
                 else:
                     new_queue.append(msg)
@@ -375,7 +374,11 @@ async def check_chats():
         state['queued_messages'][str(channel.id)]=new_queue
         keep_state()
 
-        messages = bot.get_team_chat(team_id)
+        messages = None
+        try:
+            messages = bot.get_team_chat(team_id)
+        except:
+            messages = bot.channel_connect(team_id)
 
         to_handle = []
         last_posted_message=state.get('last_posted_message', {})
@@ -401,11 +404,15 @@ async def check_chats():
                 if chatmsg['msg'] in joined:
                    del joined[chatmsg['msg']]
             if chatmsg['type']=='promote':
-                postmsg = chatmsg['promoter']+' has promoted '+chatmsg['promoted']+"."
+                if not "promoted" in chatmsg:
+                    continue
+                postmsg = author+' has promoted '+chatmsg['promoted']+"."
                 if chatmsg['promoted'] in joined:
                     del joined[chatmsg['promoted']]
             if chatmsg['type']=='demote':
-                postmsg = chatmsg['demoter']+' has demoted '+chatmsg['demoted']+"."
+                if not "demoted" in chatmsg:
+                    continue
+                postmsg = author+' has demoted '+chatmsg['demoted']+"."
             if chatmsg['type']=='boot':
                 postmsg = author+' has booted '+chatmsg['booted']+"."
             if chatmsg['type']=='join':
@@ -428,26 +435,29 @@ async def check_chats():
             if not temp_webhook:
                 temp_webhook = await channel.create_webhook(name = hook_name)
             colour = int(chat.get('colour', '0xffffff'), 16)
-            embed = discord.Embed(colour=colour, description=to_discord)
-            await temp_webhook.send(embed=embed, username=author)
+            if to_discord:
+                embed = discord.Embed(colour=colour, description=to_discord)
+                await temp_webhook.send(embed=embed, username=author)
 
             if chatmsg['type']=='join':
-                 time.sleep(0.1)
-                 await channel.send("?playerinfo -id "+authorId)
+                time.sleep(0.1)
+                pretty = bot.pretty_print_player_info(authorId, author)
+                embed2 = discord.Embed(colour=colour, description=pretty)
+                #await temp_webhook.send(embed=embed2, username=author)
+                bot.send_chat_message(team_id, pretty)
 
             last_posted_message[team_id] = when
             state['last_posted_message'] = last_posted_message
             keep_state()
 
-            if not chat.get('read_only'):
-              for join in set(joined.keys()):
-                logger.info("promoting or banning {}.".format(join))
-                await welcome_and_promote(team_id, join, joined[join])
+        if not chat.get('read_only'):
+           for join in set(joined.keys()):
+             logger.info("promoting or banning {}.".format(join))
+             await welcome_and_promote(team_id, join, joined[join])
 
         logger.info("Finished checking "+chat['name'])
     logger.info("Finished background task.")
 
     is_running = False
-
 
 client.run(settings.get('token'))
